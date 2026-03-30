@@ -1,0 +1,17 @@
+# LUPA v1.1 - SECOP Analysis
+# Ignore large data files
+data/raw/
+data/processed/
+
+# Ignore Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Keep reports (if smaller than 50MB)
+!reports/
+!reports/*.csv

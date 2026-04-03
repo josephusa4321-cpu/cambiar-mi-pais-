@@ -15,3 +15,13 @@ Thumbs.db
 # Keep reports (if smaller than 50MB)
 !reports/
 !reports/*.csv
+node_modules
+.next
+.gemini/
+.env
+.env.local
+.venv
+venv/
+out/
+build/
+dist/

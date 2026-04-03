@@ -25,27 +25,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r workers/requirements.txt
 
-      - name: 🐺 Paso 1: Ingesta de Contratos (SECOP II)
+      - name: "🐺 Paso 1: Ingesta de Contratos (SECOP II)"
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python workers/secop_ingest.py
 
-      - name: 📈 Paso 1.5: Ingesta de Adiciones (Sobrecostos)
+      - name: "📈 Paso 1.5: Ingesta de Adiciones (Sobrecostos)"
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python workers/scoring_engine/adiciones_ingest.py
 
-      - name: 🧠 Paso 2: Motor de Scoring V2 (Riesgo Algorítmico)
+      - name: "🧠 Paso 2: Motor de Scoring V2 (Riesgo Algorítmico)"
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python workers/scoring_engine/scoring_engine.py
 
-      - name: 📢 Paso 3: Resumen Diario Telegram (@LupaMedellin)
+      - name: "📢 Paso 3: Resumen Diario Telegram (@LupaMedellin)"
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

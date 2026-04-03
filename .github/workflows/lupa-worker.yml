@@ -25,19 +25,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r workers/requirements.txt
 
-      - name: 🐺 Paso 1: Ingesta de Datos (SECOP II)
+      - name: 🐺 Paso 1: Ingesta de Contratos (SECOP II)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python workers/secop_ingest.py
 
-      - name: 🧠 Paso 2: Motor de Scoring (Riesgo Algorítmico)
+      - name: 📈 Paso 1.5: Ingesta de Adiciones (Sobrecostos)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python workers/scoring_engine.py
+        run: python workers/scoring_engine/adiciones_ingest.py
 
-      - name: 📢 Paso 3: Distribución Telegram (@LupaMedellin)
+      - name: 🧠 Paso 2: Motor de Scoring V2 (Riesgo Algorítmico)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python workers/scoring_engine/scoring_engine.py
+
+      - name: 📢 Paso 3: Resumen Diario Telegram (@LupaMedellin)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}

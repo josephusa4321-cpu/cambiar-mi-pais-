@@ -1,197 +1,140 @@
-# scoring_engine.py — LUPA MVP v1.1 — con flags VigIA + OCP
+import os
+import logging
 import pandas as pd
-import sys
-import io
+from supabase import create_client, Client
+from dotenv import load_dotenv
 
-# Forzar UTF-8 en Windows para evitar errores de codificación en consola
-if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+load_dotenv()
 
-SMMLV_2026      = 1_423_500
-UMBRAL_MINIMA   = 28  * SMMLV_2026   # ~$39.8M
-UMBRAL_LICIT    = 1000 * SMMLV_2026  # ~$1,423M
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("lupa.scoring_v2")
 
-ENTIDADES_PUBLICAS = {
-    '800194096','890905378','900602106','800153898',
-    '890904996','900006094','890900608','811021514',
-    '890903790','890904153','890904635','890980040','800025606',
-}
+# Config
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
-def flag_A1(row):
-    modalidad = str(row.get('modalidad','')).lower()
-    valor     = float(row.get('valor_del_contrato', 0) or 0)
-    nit       = str(row.get('nit_proveedor','') or '').strip()
+# LUPA Constants
+SMMLV_2026 = 1_423_500
+UMBRAL_MINIMA = 28 * SMMLV_2026   # ~$39.8M
+UMBRAL_LICIT = 1000 * SMMLV_2026 # ~$1,423M
 
-    if 'directa' not in modalidad and 'minima cuant' not in modalidad:
-        return 0, None
-    if 'minima cuant' in modalidad:
-        return (12, "Mínima cuantía por valor superior al umbral") if valor > UMBRAL_MINIMA else (0, None)
+# --- RISK FLAGS ---
 
-    if valor > 2_000_000_000:   pts, desc = 30, f"Contratación directa ${valor/1e9:.1f}B sin licitación"
-    elif valor > 1_000_000_000: pts, desc = 22, f"Contratación directa ${valor/1e6:.0f}M sin licitación"
-    elif valor > 500_000_000:   pts, desc = 16, f"Contratación directa ${valor/1e6:.0f}M sin licitación"
-    else:                        pts, desc = 12, "Contratación directa sin competencia"
-
-    if nit in ENTIDADES_PUBLICAS:
-        just = str(row.get('justificacion_modalidad','') or '')
-        return (int(pts*0.5), f"[INTERADM] {desc}") if len(just)>20 else (int(pts*0.8), f"[INTERADM SIN JUSTIF] {desc}")
-    return pts, desc
-
-def flag_A5(row):
-    modalidad = str(row.get('modalidad','')).lower()
-    just      = str(row.get('justificacion_modalidad','') or '').strip()
-    valor     = float(row.get('valor_del_contrato', 0) or 0)
+def flag_A1_contratacion_directa(row):
+    """A1: Abuso de la contratación directa."""
+    modalidad = str(row.get('modalidad_de_contratacion','')).lower()
+    valor = float(row.get('valor_del_contrato', 0) or 0)
+    
     if 'directa' not in modalidad: return 0, None
-    sin_just = just in ['','nan','None','No Definido','Sin Descripcion','No definido'] or len(just)<20
-    if sin_just and valor > 200_000_000:
-        return 8, "Contratación directa sin justificación documentada"
+    
+    if valor > UMBRAL_LICIT: return 30, f"Contratación directa de gran magnitud (${valor/1e9:.1f}B)"
+    if valor > 500_000_000: return 20, f"Contratación directa de alto valor (${valor/1e6:.0f}M)"
+    return 12, "Contratación directa sin competencia"
+
+def flag_B1_sobrecosto_adicion(row, adiciones_sum):
+    """B1: Adición presupuestal > 50% (Flag crítica legal)."""
+    valor_original = float(row.get('valor_del_contrato', 1) or 1)
+    ratio = adiciones_sum / valor_original
+    
+    if ratio > 0.50: return 40, f"⚠️ ADICIÓN ILEGAL: Supera el 50% del valor original ({ratio:.1%})"
+    if ratio > 0.30: return 20, f"Adición sustancial del {ratio:.1%}"
+    if ratio > 0.10: return 10, f"Adición del {ratio:.1%}"
     return 0, None
 
-def flag_IRIC_firma_tardia(row):
-    """Hallazgo clave de VigIA — contrato firmado DESPUÉS de su inicio."""
-    firma = row.get('fecha_firma')
-    inicio = row.get('fecha_inicio')
-    if pd.isna(firma) or pd.isna(inicio):
-        return 8, "Fechas de firma o inicio ausentes — opacidad crítica"
-    try:
-        dias = (firma - inicio).days
-        if dias > 20: return 15, f"Contrato firmado {dias} días DESPUÉS de su inicio (señal VigIA)"
-        if dias > 0:  return 8,  f"Contrato firmado {dias} días después de su inicio"
-    except: pass
+def flag_C2_prorroga_tiempo(row, dias_adicionados):
+    """C2: Prórrogas excesivas en tiempo."""
+    if dias_adicionados > 365: return 10, f"Contrato prorrogado más de 1 año ({dias_adicionados} días)"
+    if dias_adicionados > 180: return 5, f"Contrato prorrogado más de 6 meses ({dias_adicionados} días)"
     return 0, None
 
-def flag_R031(row):
-    """Precio adjudicado = presupuesto oficial → posible fuga de información."""
+def flag_D1_objeto_vago(row):
+    """D1: Objeto del contrato sospechosamente genérico."""
+    objeto = str(row.get('objeto_del_contrato', '') or '').lower()
     valor = float(row.get('valor_del_contrato', 0) or 0)
-    saldo = float(row.get('saldo_cdp', 0) or 0)
-    if saldo == 0 or valor == 0: return 0, None
-    ratio = valor / saldo
-    if ratio >= 0.99: return 10, f"Precio adjudicado es {ratio:.1%} del presupuesto oficial — posible fuga de info"
-    if ratio >= 0.96: return 5,  f"Precio muy cercano al presupuesto oficial ({ratio:.1%})"
-    return 0, None
-
-def flag_R054(row):
-    """Contrato directo + anticipo superan umbral de licitación."""
-    if 'directa' not in str(row.get('modalidad','')).lower(): return 0, None
-    valor    = float(row.get('valor_del_contrato', 0) or 0)
-    anticipo = float(row.get('valor_anticipo', 0) or 0)
-    if (valor + anticipo) > UMBRAL_LICIT and valor < UMBRAL_LICIT:
-        return 15, f"Contrato directo + adiciones = ${(valor+anticipo)/1e9:.1f}B — supera umbral de licitación"
-    return 0, None
-
-def flag_C1(row):
-    original = float(row.get('valor_del_contrato', 0) or 0)
-    anticipo = float(row.get('valor_anticipo', 0) or 0)
-    if original == 0: return 0, None
-    ratio = anticipo / original
-    if ratio > 0.5: return 10, f"Anticipo del {ratio:.0%} del valor total"
-    if ratio > 0.3: return 6,  f"Anticipo del {ratio:.0%} del valor total"
-    if ratio > 0.15: return 3, f"Anticipo del {ratio:.0%} del valor total"
-    return 0, None
-
-def flag_C2(row):
-    dias  = float(row.get('dias_adicionados', 0) or 0)
-    valor = float(row.get('valor_del_contrato', 0) or 0)
-    if dias > 365 and valor > 500_000_000: return 8, f"Prorrogado {dias:.0f} días — revisión recomendada"
-    if dias > 180: return 4, f"Prorrogado {dias:.0f} días"
-    return 0, None
-
-def flag_D1(row):
-    objeto = str(row.get('objeto','') or '').lower()
-    valor  = float(row.get('valor_del_contrato', 0) or 0)
-    VAGAS  = ['apoyo a la gestión','apoyo a la gestion','servicios de apoyo',
-              'actividades administrativas','gestión administrativa']
+    VAGAS = ['apoyo a la gestion', 'servicios de apoyo', 'actividades administrativas']
+    
     if any(p in objeto for p in VAGAS) and valor > 100_000_000:
-        return 4, "Objeto vago ('apoyo a la gestión') para valor alto"
-    if len(objeto) < 50 and valor > 100_000_000:
-        return 2, f"Objeto muy corto ({len(objeto)} chars) para ${valor/1e6:.0f}M"
+        return 10, "Objeto genérico (Apoyo a la gestión) con valor alto"
     return 0, None
 
-def flag_D2(row):
-    url   = str(row.get('url_proceso','') or '')
-    valor = float(row.get('valor_del_contrato', 0) or 0)
-    if url in ['nan','None','','{}'] and valor > 50_000_000:
-        return 4, "Contrato sin URL de proceso publicada"
-    return 0, None
-
-def flag_R047(row):
-    nombre = str(row.get('nombre_proveedor','') or '').lower()
-    valor  = float(row.get('valor_del_contrato', 0) or 0)
-    VAGAS  = ['servicios generales','soluciones integrales','comercializadora',
-              'inversiones y','grupo empresarial','asesorias y','consultoria y']
-    if any(p in nombre for p in VAGAS) and valor > 100_000_000:
-        return 6, f"Proveedor con nombre genérico difícil de rastrear"
-    return 0, None
-
-TRADUCCION = {
-    3_000_000_000: lambda v: f"{v/3e9:.1f} colegios nuevos",
-    350_000_000:   lambda v: f"{v/350e6:.0f} ambulancias equipadas",
-    70_000_000:    lambda v: f"{v/70e6:.0f} canchas deportivas",
-    0:             lambda v: f"refrigerio de {int(v/3650 or 0):,} niños por 1 año",
-}
-def impacto_ciudadano(valor):
-    for umbral, fn in sorted(TRADUCCION.items(), reverse=True):
-        if valor >= umbral: return fn(valor)
-    return "N/A"
-
-def calcular_score(row):
-    flags = []
-    # Usamos una lista de funciones para facilitar el bucle
-    flag_functions = [
-        (flag_A1,'A1'),(flag_A5,'A5'),(flag_IRIC_firma_tardia,'IRIC'),
-        (flag_R031,'R031'),(flag_R054,'R054'),(flag_C1,'C1'),
-        (flag_C2,'C2'),(flag_D1,'D1'),(flag_D2,'D2'),(flag_R047,'R047')
-    ]
-    for fn, cod in flag_functions:
-        pts, desc = fn(row)
-        if pts > 0:
-            flags.append({'codigo': cod, 'descripcion': desc, 'puntos': pts})
-
-    total = min(sum(f['puntos'] for f in flags), 100)
-    if len(flags) >= 3: 
-        total = min(total + 10, 100)  # bonus patrón sistémico
-
-    nivel = 'CRÍTICO' if total>=80 else 'ALTO' if total>=65 else 'MEDIO' if total>=40 else 'BAJO'
+def calcular_score_total(row, ads_row):
+    ads_valor = ads_row.get("valor_adicionado", 0) if pd.notna(ads_row) else 0
+    ads_dias = ads_row.get("dias_adicionados", 0) if pd.notna(ads_row) else 0
+    
+    flags_list = []
+    
+    # Evaluar Flags
+    f1_pts, f1_desc = flag_A1_contratacion_directa(row)
+    if f1_pts > 0: flags_list.append({"cod": "A1", "pts": f1_pts, "desc": f1_desc})
+    
+    f2_pts, f2_desc = flag_B1_sobrecosto_adicion(row, ads_valor)
+    if f2_pts > 0: flags_list.append({"cod": "B1", "pts": f2_pts, "desc": f2_desc})
+    
+    f3_pts, f3_desc = flag_C2_prorroga_tiempo(row, ads_dias)
+    if f3_pts > 0: flags_list.append({"cod": "C2", "pts": f3_pts, "desc": f3_desc})
+    
+    f4_pts, f4_desc = flag_D1_objeto_vago(row)
+    if f4_pts > 0: flags_list.append({"cod": "D1", "pts": f4_pts, "desc": f4_desc})
+    
+    total_score = sum(f['pts'] for f in flags_list)
+    # Multiplicador por sistemática (si hay más de 3 flags, sumamos 10 puntos extra)
+    if len(flags_list) >= 3: total_score += 10
+    
+    total_score = min(total_score, 100)
+    
+    nivel = "CRÍTICO" if total_score >= 80 else "ALTO" if total_score >= 60 else "MEDIO" if total_score >= 30 else "BAJO"
+    
     return {
-        'score': total, 'nivel': nivel, 'n_flags': len(flags),
-        'razon_principal': flags[0]['descripcion'] if flags else "Sin señales",
-        'flags_detalle': str([f['codigo'] for f in sorted(flags, key=lambda x: x['puntos'], reverse=True)]),
+        "id_contrato": row["id_contrato"],
+        "score_total": int(total_score),
+        "nivel_riesgo": nivel,
+        "flags_detectadas": [f['cod'] for f in flags_list],
+        "traduccion_ciudadana": flags_list[0]['desc'] if flags_list else "Sin riesgos detectados",
+        "documento_proveedor": str(row.get("documento_proveedor", ""))
     }
 
+def run_scoring():
+    if not supabase: return
+    
+    logger.info("🧠 Iniciando MOTOR DE SCORING V2 (Brain Mode)...")
+    
+    # 1. Obtener Contratos Raw
+    res_contratos = supabase.table("contratos_raw").select("*").execute()
+    df_contratos = pd.DataFrame(res_contratos.data)
+    
+    # 2. Obtener Agregado de Adiciones
+    res_ads = supabase.table("contratos_adiciones").select("id_contrato, valor_adicionado, dias_adicionados").execute()
+    df_ads = pd.DataFrame(res_ads.data)
+    
+    if not df_ads.empty:
+        df_ads_grouped = df_ads.groupby("id_contrato").agg({
+            "valor_adicionado": "sum",
+            "dias_adicionados": "sum"
+        }).reset_index()
+    else:
+        df_ads_grouped = pd.DataFrame(columns=["id_contrato", "valor_adicionado", "dias_adicionados"])
+        
+    # 3. Join y Scoring
+    logger.info(f"Procesando scores para {len(df_contratos)} contratos...")
+    
+    scored_records = []
+    for _, row in df_contratos.iterrows():
+        # Buscar adiciones para este contrato
+        ads_row = df_ads_grouped[df_ads_grouped["id_contrato"] == row["id_contrato"]]
+        ads_data = ads_row.iloc[0] if not ads_row.empty else None
+        
+        score_data = calcular_score_total(row, ads_data)
+        scored_records.append(score_data)
+        
+    # 4. Upsert a contratos_scored
+    if scored_records:
+        batch_size = 100
+        for i in range(0, len(scored_records), batch_size):
+            batch = scored_records[i : i + batch_size]
+            supabase.table("contratos_scored").upsert(batch, on_conflict="id_contrato").execute()
+            
+    logger.info(f"✅ Scoring completado para {len(scored_records)} registros.")
+
 if __name__ == "__main__":
-    print("⚙️  Calculando scores LUPAVigIA v1.1...")
-    try:
-        df = pd.read_csv("contratos_aptos.csv", low_memory=False)
-    except FileNotFoundError:
-        print("❌ Error: No se encuentra contratos_aptos.csv. Ejecuta quality_gate.py primero.")
-        sys.exit(1)
-
-    # Conversión de fechas una sola vez al inicio (Optimización crítica)
-    print("🕒 Convirtiendo fechas...")
-    for col in ['fecha_firma','fecha_inicio','fecha_fin']:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors='coerce')
-
-    print(f"📊 Procesando {len(df)} registros con lógica LUPA v1.1...")
-    # El apply sigue siendo necesario por la complejidad de las reglas, 
-    # pero sin pd.to_datetime interno es mucho más rápido.
-    df_results = df.apply(lambda r: pd.Series(calcular_score(r.to_dict())), axis=1)
-    df = pd.concat([df, df_results], axis=1)
-    
-    print("💰 Calculando impacto ciudadano...")
-    df['impacto_ciudadano'] = df['valor_del_contrato'].apply(lambda v: impacto_ciudadano(float(v or 0)))
-    
-    print("💾 Guardando resultados...")
-    df.to_csv("contratos_scored.csv", index=False)
-
-    print("\n📊 Distribución de niveles:")
-    if 'nivel' in df.columns:
-        print(df['nivel'].value_counts())
-    
-    print("\n🚨 Top 10 contratos más sospechosos:")
-    cols_top = ['nombre_entidad','nombre_proveedor','valor_del_contrato','score','nivel','razon_principal','impacto_ciudadano']
-    top10 = df.nlargest(10, 'score')
-    print(top10[cols_top].to_string(index=False))
-    
-    top10[cols_top].to_csv("top10_sospechosos.csv", index=False)
-    print("\n✨ Proceso completado exitosamente.")
+    run_scoring()

@@ -1,71 +1,88 @@
-import requests
-import pandas as pd
-import sys
-import io
 import os
+import logging
+import httpx
+import pandas as pd
+from supabase import create_client, Client
+from dotenv import load_dotenv
 
-# Forzar salida en UTF-8 para evitar errores en Windows
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("lupa.ingest_adiciones")
+
+# Config
+SODA_TOKEN = os.environ.get("SODA_APP_TOKEN")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 # Dataset ID: cb9c-h8sn (Adiciones SECOP II)
 ADICIONES_URL = "https://www.datos.gov.co/resource/cb9c-h8sn.json"
-OUTPUT_FILE = "data/raw/adiciones_raw.csv"
 
-# Filtrar por los Nits que nos interesan para el MVP
-# 890905378: Distrito de Medellín
-# 890900286: Gobernación de Antioquia
-FILTRO_ENTIDADES = "nit_entidad IN ('890905378','890900286')"
+# Filtro Medellín (Nit: 890905378)
+FILTRO_ENTIDADES = "nit_entidad = '890905378'"
 
-def extraer_adiciones_optimizadas(limite=10000):
-    os.makedirs("data/raw", exist_ok=True)
-    offset = 0
-    primera_vez = True
+def fetch_adiciones(offset=0, limit=1000):
+    params = {
+        "$limit": limit,
+        "$offset": offset,
+        "$where": FILTRO_ENTIDADES,
+        "$order": ":id ASC"
+    }
+    headers = {"X-App-Token": SODA_TOKEN} if SODA_TOKEN else {}
     
-    # Reiniciamos el archivo para tener la data limpia de Medellín/Antioquia
-    if os.path.exists(OUTPUT_FILE):
-        os.remove(OUTPUT_FILE)
+    try:
+        with httpx.Client() as client:
+            res = client.get(ADICIONES_URL, params=params, headers=headers, timeout=60)
+            res.raise_for_status()
+            return res.json()
+    except Exception as e:
+        logger.error(f"Error fetching adiciones: {e}")
+        return []
 
-    print(f"🎯 Iniciando descarga OPTIMIZADA (Solo Medellín/Antioquia) en {OUTPUT_FILE}...")
-
-    total_descargado = 0
+def run_ingest():
+    if not supabase: 
+        logger.error("Supabase client not initialized.")
+        return
+    
+    logger.info("🎯 Iniciando ingesta de ADICIONES para Medellín...")
+    
+    offset = 0
+    total_procesados = 0
+    
     while True:
+        data = fetch_adiciones(offset)
+        if not data:
+            break
+            
+        df = pd.DataFrame(data)
+        
+        # Mapping API -> Database
+        # API: id_modificacion, id_contrato, tipo, descripcion, valor_modificacion, dias_modificacion
+        records = []
+        for _, row in df.iterrows():
+            records.append({
+                "id_adicion": str(row.get("id_modificacion", f"gen_{offset}_{_}")),
+                "id_contrato": str(row.get("id_contrato")),
+                "tipo": str(row.get("tipo", "N/A")),
+                "descripcion": str(row.get("descripcion", "")),
+                "valor_adicionado": float(row.get("valor_modificacion", 0) or 0),
+                "dias_adicionados": int(row.get("dias_modificacion", 0) or 0)
+            })
+            
+        # Batch Upsert
         try:
-            # Socrata query: $where para filtrar en el servidor
-            params = {
-                "$limit": limite, 
-                "$offset": offset,
-                "$where": FILTRO_ENTIDADES
-            }
-            r = requests.get(ADICIONES_URL, params=params, timeout=60)
-            
-            if r.status_code != 200:
-                print(f"Error {r.status_code}: {r.text[:200]}")
-                break
-            
-            batch = r.json()
-            if not batch: 
-                print("\n✅ Final de la tabla alcanzado para estas entidades.")
-                break
-            
-            df_batch = pd.DataFrame(batch)
-            df_batch.to_csv(OUTPUT_FILE, mode='a', index=False, header=primera_vez, encoding='utf-8')
-            
-            primera_vez = False
-            total_descargado += len(batch)
-            offset += limite
-            
-            print(f"  → {total_descargado} adiciones de interés guardadas...")
-            
+            supabase.table("contratos_adiciones").upsert(records, on_conflict="id_adicion").execute()
+            total_procesados += len(records)
+            logger.info(f"Procesadas {total_procesados} adiciones...")
         except Exception as e:
-            print(f"\n❌ Error en la petición: {e}")
-            import time
-            time.sleep(5)
-            continue
+            logger.error(f"Error in batch upsert: {e}")
             
-    return total_descargado
+        if len(data) < 1000:
+            break
+        offset += 1000
+
+    logger.info(f"✅ Ingesta de adiciones completada: {total_procesados} registros.")
 
 if __name__ == "__main__":
-    print("🔍 LUPA Sprint 2: Radar de Sobrecostos Seleccionado")
-    total = extraer_adiciones_optimizadas()
-    print(f"\n✅ Proceso finalizado. Total registros de interés: {total}")
+    run_ingest()

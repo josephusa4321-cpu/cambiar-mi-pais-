@@ -26,8 +26,7 @@ def fetch_adiciones(offset=0, limit=1000):
     params = {
         "$limit": limit,
         "$offset": offset,
-        "$where": FILTRO_ENTIDADES,
-        "$order": ":id ASC"
+        "$where": FILTRO_ENTIDADES
     }
     headers = {"X-App-Token": SODA_TOKEN} if SODA_TOKEN else {}
     

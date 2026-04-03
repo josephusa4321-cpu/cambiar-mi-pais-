@@ -30,7 +30,7 @@ def get_last_run():
 def fetch_secop(last_run=None):
     # Medellín Filter: upper(ciudad) = 'MEDELLÍN'
     # Incremental: ultima_actualizacion > {last_run}
-    where = "upper(ciudad) LIKE '%25MEDELL%25'"
+    where = "upper(ciudad) LIKE '%MEDELL%'"
     if last_run:
         where += f" AND ultima_actualizacion > '{last_run}'"
     

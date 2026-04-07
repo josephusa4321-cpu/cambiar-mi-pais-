@@ -14,7 +14,7 @@ export const DisclaimerSlapp: React.FC = () => {
           Este sistema utiliza un <strong>modelo de riesgo algorítmico</strong> basado exclusivamente en datos públicos 
           proporcionados por el portal <span className="text-slate-300">datos.gov.co</span> (SECOP II). 
           Los puntajes y alertas generados representan una <strong>probabilidad estadística de irregularidad</strong> y 
-          no constituyen una acusación formal de corrupción ni una prueba de ilegalidad. 
+          no constituyen una acusación formal ni una prueba de ilegalidad. 
           LUPA promueve la veeduría ciudadana técnica y objetiva.
         </p>
       </div>

@@ -6,3 +6,7 @@ pydantic
 pydantic-settings
 uvloop
 httpx
+networkx>=3.2
+rapidfuzz>=3.6
+numpy>=1.26
+pandas>=2.2

@@ -25,7 +25,7 @@ LUPA es un sistema de monitoreo automatizado diseñado para detectar riesgos en 
 ## ⚖️ Blindaje Jurídico y Disclaimer (SLAPP)
 **IMPORTANTE:** Lupa es un sistema de **análisis de riesgo estadístico**, NO una plataforma de acusación criminal. 
 
-- El término **"corrupción"** no forma parte de los resultados del sistema. Se utiliza estrictamente la categoría **"Riesgo Algorítmico"**. 
+- El término **"corrupción"** no forma parte de los resultados del sistema (excepto en referencias académicas o legales externas). Se utiliza estrictamente la categoría **"Riesgo Algorítmico"**. 
 - Los datos mostrados provienen de fuentes oficiales (datos.gov.co) y son procesados automáticamente.
 - Cualquier hallazgo debe ser validado por entes de control u organismos de periodismo de investigación antes de emitir juicios de valor.
 

@@ -1,206 +1,272 @@
 import os
 import logging
-import json
+import pandas as pd
 from datetime import datetime, timezone
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
+# Importar el ÚNICO cerebro certificado
+# Se asume ejecución desde la raíz del proyecto para resolver el paquete
+try:
+    from workers.scoring_logic import score_single_contract
+    from workers.constants import (
+        SMMLV_2026, UMBRAL_LICIT, UMBRAL_MINIMA,
+        COLUMNAS_SCORING, BATCH_SIZE_UPSERT
+    )
+except ImportError:
+    # Fallback para ejecución directa desde la carpeta workers/
+    from scoring_logic import score_single_contract
+    from constants import (
+        SMMLV_2026, UMBRAL_LICIT, UMBRAL_MINIMA,
+        COLUMNAS_SCORING, BATCH_SIZE_UPSERT
+    )
+
 load_dotenv()
+logger = logging.getLogger("lupa.engine")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("lupa.scoring")
+SUPABASE_URL = os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SERVICE_ROLE_KEY")
 
-# Config
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise EnvironmentError("SUPABASE_URL o SUPABASE_SERVICE_KEY no configurados")
 
-# 10 Indicators Weight Map (A1-D2)
-WEIGHTS = {
-    "A1": 20, # Unico Oferente
-    "A2": 15, # Velocidad (Apertura-Cierre < 48h)
-    "B1": 15, # Adición > 45%
-    "B3": 10, # Iterativo (Directa recurrente)
-    "C1": 30, # Sancionado
-    "C3": 5,  # Objeto Vago
-    "D1": 10, # Precio Inusual (vs Promedio Sector) - Mocked logic
-    "D2": 5,  # Sector de Alto Riesgo (Logística/Eventos)
-}
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ICD Mandatory Fields (12)
-ICD_FIELDS = [
-    "nombre_entidad", "nit_entidad", "modalidad_de_contratacion", 
-    "justificacion_modalidad_de", "valor_del_contrato", "documento_proveedor", 
-    "proveedor_adjudicado", "fecha_de_firma", "numero_de_oferentes",
-    "precio_base", "fecha_de_publicacion_del_proceso", "descripcion_del_proceso"
-]
-
-def normalize_valor(valor):
-    """Bug de centavos: Truncar a entero para evitar inconsistencias en comparaciones."""
-    try:
-        return int(float(valor))
-    except (TypeError, ValueError):
-        return 0
-
-def calculate_icd(contrato: dict):
-    faltantes = [f for f in ICD_FIELDS if not contrato.get(f)]
-    # Normalize valor field specifically
-    if contrato.get("valor_del_contrato"):
-        contrato["valor_del_contrato"] = normalize_valor(contrato["valor_del_contrato"])
+def run_scoring(modo: str = "delta") -> None:
+    """
+    Orquestador de scoring. Lee contratos_raw, hace JOIN con adiciones,
+    llama al motor puro score_single_contract(), y persiste en contratos_scored.
     
-    score = int(((len(ICD_FIELDS) - len(faltantes)) / len(ICD_FIELDS)) * 100)
-    return score, faltantes
+    modo: "delta" (default) — solo contratos nuevos desde último run
+          "full" — reprocesa todo el histórico
+    """
+    logger.info(f"🧠 LUPA Engine iniciando | Modo: {modo.upper()}")
 
-def get_citizen_translation(banderas: list):
-    if not banderas: return "No se detectaron riesgos significativos en los datos analizados."
-    
-    translations = []
-    if "A1" in banderas: translations.append("Este contrato se entregó con un único competidor, limitando la transparencia.")
-    if "A2" in banderas: translations.append("El proceso se abrió y cerró tan rápido que parece estar dirigido.")
-    if "B1" in banderas: translations.append("Se adicionó casi el 50% del valor inicial, lo cual es una alerta de planeación pobre o sobrecosto.")
-    if "C1" in banderas: translations.append("El proveedor tiene antecedentes de sanciones en otros entes de control.")
-    if "C3" in banderas: translations.append("La descripción es tan vaga que no es posible saber qué se está comprando exactamente.")
-    if "B3" in banderas: translations.append("Este contratista es recurrente en contratos de alto riesgo, lo que indica un posible patrón sistémico.")
-    if "D1" in banderas: translations.append("El valor de este contrato supera el promedio histórico aceptado para este tipo de bienes o servicios.")
-    if "D2" in banderas: translations.append("Este sector (Eventos/Logística) es históricamente propenso a riesgos algorítmicos altos.")
-    
-    return " ".join(translations[:2]) # Max 2 or joined
-
-def calculate_score(contrato: dict):
-    banderas = []
-    score_total = 0
-    categories = set()
-    doc_id = contrato.get("documento_proveedor")
-
-    # B3: Recurrencia Automática (Network Graph Basic)
-    if doc_id and supabase:
+    # --- 1. Delta: obtener timestamp del último run ---
+    ultimo_run = None
+    if modo == "delta":
         try:
-            # Query if this provider has other HIGH risk contracts (Score > 40)
-            res = supabase.table("contratos_scored").select("id_contrato", count="exact").eq("documento_proveedor", doc_id).execute()
-            if res.count and res.count >= 2:
-                banderas.append("B3")
-                score_total += WEIGHTS["B3"]
-                categories.add("B")
-                logger.info(f"B3 Detectado: El contratista {doc_id} ya tiene {res.count} alertas previas.")
+            res_meta = supabase.table("meta_pipeline") \
+                .select("ultima_ejecucion_exitosa") \
+                .eq("nombre_pipeline", "scoring_engine") \
+                .execute()
+            if res_meta.data:
+                ultimo_run = res_meta.data[0].get("ultima_ejecucion_exitosa")
+                logger.info(f"Delta desde: {ultimo_run}")
         except Exception as e:
-            logger.error(f"Error checking B3 recurrence: {e}")
+            logger.warning(f"No se pudo leer meta_pipeline: {e} — procesando todo")
 
-    # A1: Unico Oferente
-    if contrato.get("numero_de_oferentes", 0) == 1:
-        banderas.append("A1")
-        score_total += WEIGHTS["A1"]
-        categories.add("A")
-
-    # A2: Velocidad < 48h
-    if contrato.get("fecha_de_publicacion_del_proceso") and contrato.get("fecha_de_recepcion_de_ofertas"):
+    # --- 1.2 Carga de base de datos SIRI (Procuraduría) ---
+    df_siri = pd.DataFrame()
+    siri_path = os.path.join("workers", "data", "siri_total.csv")
+    if os.path.exists(siri_path):
         try:
-            pub = datetime.fromisoformat(contrato["fecha_de_publicacion_del_proceso"])
-            rec = datetime.fromisoformat(contrato["fecha_de_recepcion_de_ofertas"])
-            if (rec - pub).total_seconds() < 172800: # 48 hours
-                banderas.append("A2")
-                score_total += WEIGHTS["A2"]
-                categories.add("A")
-        except: pass
+            df_siri = pd.read_csv(siri_path, dtype={"numero_identificacion": str})
+            df_siri["numero_identificacion"] = df_siri["numero_identificacion"].str.strip()
+            logger.info(f"📁 SIRI Cache: {len(df_siri)} registros cargados correctamente.")
+        except Exception as e:
+            logger.error(f"❌ Error cargando SIRI CSV: {e}")
+    else:
+        logger.warning(f"⚠️ SIRI Cache no encontrado en {siri_path}. B1 permanecerá inactiva.")
 
-    # B1: Adición > 45% (Calculado si existe dato de adición)
-    # Mocked simplified check: Si el valor actual es > 1.45 * valor base (si tuviéramos histórico)
-    # Por ahora solo activamos si el flag de adición masiva está presente
-    
-    # C1: Sancionado (Cruce con lista externa)
-    # dummy_sancionados = ["800123456", "900555666"]
-    # if contrato.get("documento_proveedor") in dummy_sancionados:
-    #    banderas.append("C1")
-    #    score_total += WEIGHTS["C1"]
-    #    categories.add("C")
+    # --- 2. Cargar contratos (solo columnas necesarias) ---
+    try:
+        # COLUMNAS_SCORING es una lista en constants.py, Supabase select() espera string
+        select_cols = ",".join(COLUMNAS_SCORING)
+        all_contracts = []
+        page_size = 1000
+        offset = 0
+        while True:
+            query = supabase.table("contratos_raw").select(select_cols).limit(page_size).offset(offset)
+            if ultimo_run:
+                query = query.gt("ultima_actualizacion", ultimo_run)
+            res = query.execute()
+            if not res.data:
+                break
+            all_contracts.extend(res.data)
+            if len(res.data) < page_size:
+                break
+            offset += page_size
+        df_contratos = pd.DataFrame(all_contracts)
+    except Exception as e:
+        logger.error(f"❌ Error leyendo contratos_raw: {e}")
+        return
 
-    # C3: Objeto Vago
-    desc = contrato.get("descripcion_del_proceso", "")
-    if desc and len(desc.split()) < 8:
-        banderas.append("C3")
-        score_total += WEIGHTS["C3"]
-        categories.add("C")
+    if df_contratos.empty:
+        logger.info("No hay contratos nuevos para procesar.")
+        return
 
-    # D1: Precio Inusual (Backend simple threshold by sector)
-    sector = contrato.get("sector", "").upper()
-    total = normalize_valor(contrato.get("valor_del_contrato", 0))
-    if sector == "SALUD" and total > 500000000: # Example logic for demo
-        banderas.append("D1")
-        score_total += WEIGHTS["D1"]
-        categories.add("D")
+    logger.info(f"Contratos a procesar: {len(df_contratos)}")
 
-    # D2: Sector de Alto Riesgo (Logística/Eventos/Educación)
-    if any(s in sector for s in ["LOGÍSTICA", "EVENTOS", "ALIMENTOS", "RECREACIÓN"]):
-        banderas.append("D2")
-        score_total += WEIGHTS["D2"]
-        categories.add("D")
+    # --- 3. Cargar adiciones (resiliente si tabla no existe) ---
+    try:
+        all_adiciones = []
+        page_size = 1000
+        offset = 0
+        while True:
+            res_ads_page = supabase.table("adiciones_raw") \
+                .select("numero_contrato, valor_adicion, dias_adicionados, descripcion") \
+                .limit(page_size).offset(offset) \
+                .execute()
+            if not res_ads_page.data:
+                break
+            all_adiciones.extend(res_ads_page.data)
+            if len(res_ads_page.data) < page_size:
+                break
+            offset += page_size
+        df_ads = pd.DataFrame(all_adiciones)
 
-    # Bonus Sistémico (+10 si ≥3 banderas de categorías diferentes)
-    if len(categories) >= 3:
-        score_total += 10
-        banderas.append("BONUS-SISTEMICO")
-
-    # Cap at 100
-    score_total = min(score_total, 100)
-    
-    nivel = "BAJO"
-    if score_total >= 70: nivel = "CRÍTICO"
-    elif score_total >= 55: nivel = "ALTO"
-    elif score_total >= 40: nivel = "MEDIO"
-
-    return score_total, nivel, banderas
-
-def process_scoring():
-    if not supabase: return
-    
-    logger.info("Iniciando ciclo de Scoring...")
-    
-    # Obtener contratos pendientes (en contratos_raw pero no en scored/opacos)
-    # O actualizados recientemente
-    res = supabase.table("contratos_raw").select("*").limit(100).execute()
-    
-    for contrato in res.data:
-        id_c = contrato["id_contrato"]
-        
-        # 1. ICD Check
-        icd_score, faltantes = calculate_icd(contrato)
-        
-        if icd_score < 40:
-            # Move to opacos
-            supabase.table("contratos_opacos").upsert({
-                "id_contrato": id_c,
-                "icd_score": icd_score,
-                "campos_faltantes": faltantes
-            }).execute()
-            # Eliminar de scored si existía
-            supabase.table("contratos_scored").delete().eq("id_contrato", id_c).execute()
-            logger.info(f"Contrato {id_c} clasificado como OPACO (ICD: {icd_score})")
-            continue
-
-        # 2. Risk Calculation
-        score, nivel, banderas = calculate_score(contrato)
-        traduccion = get_citizen_translation(banderas)
-        
-        # 3. Upsert into scored
-        scored_data = {
-            "id_contrato": id_c,
-            "documento_proveedor": contrato.get("documento_proveedor"),
-            "score_total": score,
-            "nivel_riesgo": nivel,
-            "banderas_activas": banderas,
-            "traduccion_ciudadana": traduccion,
-            "publicado_telegram": False
-        }
-        
-        supabase.table("contratos_scored").upsert(scored_data).execute()
-        
-        # 4. Timeline de Impunidad (Nivel 2: Score >= 55)
-        if score >= 55:
-            supabase.table("timeline_impunidad").upsert({
-                "id_contrato": id_c,
-                "estado_respuesta": "PENDIENTE"
-            }, on_conflict="id_contrato").execute()
+        if not df_ads.empty:
+            # FIX C1: Extraer valor de la descripción si valor_adicion es 0 o nulo
+            from scoring_logic import extraer_valor_adicion  # Import local para evitar circularidad
             
-        logger.info(f"Contrato {id_c} procesado. Score: {score}, Nivel: {nivel}")
+            df_ads["valor_adicionado_raw"] = pd.to_numeric(df_ads["valor_adicion"], errors="coerce").fillna(0)
+            df_ads["valor_adicionado_regex"] = df_ads["descripcion"].apply(extraer_valor_adicion)
+            
+            # Si el raw es 0, usamos el regex (Prioridad: Raw > Regex si Raw > 0)
+            df_ads["valor_final_adicion"] = df_ads.apply(
+                lambda x: x["valor_adicionado_raw"] if x["valor_adicionado_raw"] > 0 else x["valor_adicionado_regex"],
+                axis=1
+            )
+            df_ads["dias_adicionados"] = pd.to_numeric(
+                df_ads["dias_adicionados"], errors="coerce"
+            ).fillna(0)
+
+            df_ads_grouped = df_ads.groupby("numero_contrato").agg(
+                valor_adicionado=("valor_final_adicion", "sum"),
+                dias_adicionados=("dias_adicionados", "sum")
+            ).reset_index()
+            df_ads_grouped.rename(columns={"numero_contrato": "id_contrato"}, inplace=True)
+        else:
+            df_ads_grouped = pd.DataFrame(
+                columns=["id_contrato", "valor_adicionado", "dias_adicionados"]
+            )
+
+    except Exception as e:
+        logger.warning(f"contratos_adiciones no disponible: {e} — B1/C2 inactivas")
+        df_ads_grouped = pd.DataFrame(
+            columns=["id_contrato", "valor_adicionado", "dias_adicionados"]
+        )
+
+    # --- 4. JOIN MAESTRO (O(N log N), no O(N²)) ---
+    # Un solo merge antes del loop — jamás filtrar dentro del loop
+    df_merged = df_contratos.merge(df_ads_grouped, on="id_contrato", how="left")
+    df_merged["valor_adicionado"] = df_merged.get("valor_adicionado", pd.Series(dtype=float)).fillna(0)
+    df_merged["dias_adicionados"] = df_merged.get("dias_adicionados", pd.Series(dtype=float)).fillna(0)
+
+    # --- 5. Cargar historial de entidad para flags contextuales (B3, C2, D2) ---
+    try:
+        all_history = []
+        page_size = 1000
+        offset = 0
+        while True:
+            res_hist_page = supabase.table("contratos_raw") \
+                .select("documento_proveedor, valor_del_contrato, nit_entidad, fecha_de_firma, modalidad_de_contratacion") \
+                .limit(page_size).offset(offset) \
+                .execute()
+            if not res_hist_page.data:
+                break
+            all_history.extend(res_hist_page.data)
+            if len(res_hist_page.data) < page_size:
+                break
+            offset += page_size
+        df_historial = pd.DataFrame(all_history)
+        df_historial["valor_del_contrato"] = pd.to_numeric(
+            df_historial["valor_del_contrato"], errors="coerce"
+        ).fillna(0)
+    except Exception as e:
+        logger.warning(f"No se pudo cargar historial para B3: {e}")
+        df_historial = pd.DataFrame()
+
+    # --- 6. Loop de scoring (solo transporte de datos) ---
+    scored_records = []
+    total_contracts = len(df_merged)
+    logger.info(f"🧠 Iniciando scoring de {total_contracts:,} contratos...")
+    logger.info(f"📊 Contrato  | Score | Nivel  | Bandas | Acumulado")
+    logger.info(f"{'-'*65}")
+
+    for idx, (_, row) in enumerate(df_merged.iterrows(), 1):
+        contrato_dict = row.to_dict()
+
+        # Construir adiciones_df para este contrato (ya agregado, 1 fila max)
+        adiciones_dict = {
+            "valor_adicionado": row.get("valor_adicionado", 0),
+            "dias_adicionados": row.get("dias_adicionados", 0)
+        }
+        adiciones_df = pd.DataFrame([adiciones_dict]) if adiciones_dict["valor_adicionado"] > 0 \
+                       else pd.DataFrame()
+
+        # Filtrar historial de la entidad del contrato actual (en memoria, no query)
+        nit = str(contrato_dict.get("nit_entidad", ""))
+        history_df = df_historial[df_historial["nit_entidad"] == nit].copy() \
+                     if not df_historial.empty and nit else pd.DataFrame()
+
+        # ÚNICO CEREBRO CERTIFICADO (v1.1 con SIRI B1)
+        resultado = score_single_contract(contrato_dict, history_df, adiciones_df, df_siri)
+
+        scored_records.append({
+            "id_contrato":         contrato_dict["id_contrato"],
+            "score_total":         resultado["score_total"],
+            "nivel_riesgo":        resultado["nivel_riesgo"],
+            "flags_detectadas":    resultado["banderas"],
+            "traduccion_ciudadana": resultado["traduccion"],
+            "documento_proveedor": str(contrato_dict.get("documento_proveedor", "")),
+            "scored_at":           datetime.now(timezone.utc).isoformat()
+        })
+
+        # Log progress cada 100 contratos o si es alto riesgo
+        if idx % 100 == 0 or resultado["score_total"] >= 40:
+            flags_str = ",".join(resultado["banderas"]) if resultado["banderas"] else "-"
+            logger.info(f"📊 {idx:>6,}/{total_contracts:,} | {resultado['score_total']:>5} | {resultado['nivel_riesgo']:<6} | {flags_str:<20} | {idx:>6,}")
+
+    logger.info(f"{'-'*65}")
+    logger.info(f"✅ Scoring completado: {len(scored_records):,} contratos procesados")
+
+    # --- 7. Batch UPSERT (500 por transacción) ---
+    exitosos, fallidos = 0, 0
+    total_batches = (len(scored_records) + BATCH_SIZE_UPSERT - 1) // BATCH_SIZE_UPSERT
+    logger.info(f"📦 Guardando {len(scored_records):,} scores en Supabase ({total_batches} batches)...")
+    logger.info(f"📊 Batch    | Estado      | Acumulado")
+    logger.info(f"{'-'*50}")
+
+    for i in range(0, len(scored_records), BATCH_SIZE_UPSERT):
+        batch = scored_records[i : i + BATCH_SIZE_UPSERT]
+        batch_num = (i // BATCH_SIZE_UPSERT) + 1
+        try:
+            supabase.table("contratos_scored") \
+                .upsert(batch, on_conflict="id_contrato") \
+                .execute()
+            exitosos += 1
+            logger.info(f"📊 {batch_num:>4}/{total_batches}   | ✅ OK        | {exitosos * BATCH_SIZE_UPSERT:>8,} regs")
+        except Exception as e:
+            fallidos += 1
+            logger.error(f"📊 {batch_num:>4}/{total_batches}   | ❌ FALLÓ     | {e}")
+
+    logger.info(f"{'-'*50}")
+
+    # --- 8. Actualizar meta_pipeline ---
+    estado = "OK" if fallidos == 0 else "PARCIAL"
+    try:
+        supabase.table("meta_pipeline").upsert({
+            "nombre_pipeline":            "scoring_engine",
+            "ultima_ejecucion_exitosa":   datetime.now(timezone.utc).isoformat(),
+            "registros_procesados":       len(scored_records),
+            "batches_exitosos":           exitosos,
+            "batches_fallidos":           fallidos,
+            "estado":                     estado
+        }, on_conflict="nombre_pipeline").execute()
+    except Exception as e:
+        logger.error(f"Error actualizando meta_pipeline: {e}")
+
+    logger.info(
+        f"✅ Engine completado | Modo: {modo} | "
+        f"Procesados: {len(scored_records)} | "
+        f"Batches OK: {exitosos} | Fallidos: {fallidos}"
+    )
+
 
 if __name__ == "__main__":
-    process_scoring()
+    import sys
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    modo = sys.argv[1] if len(sys.argv) > 1 else "delta"
+    run_scoring(modo=modo)

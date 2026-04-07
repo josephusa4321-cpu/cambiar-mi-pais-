@@ -8,6 +8,7 @@ import { motion, AnimatePresence } from 'motion/react';
 
 const NAV_LINKS = [
   { name: 'Top 10 SOS', href: '/top10' },
+  { name: 'Red', href: '/red', highlight: true },
   { name: 'Opacos', href: '/opacos' },
   { name: 'Impunidad', href: '/impunidad' },
   { name: 'Metodología', href: '/metodologia' },
@@ -24,24 +25,23 @@ export default function Header() {
         <div className="flex justify-between h-16 items-center">
           {/* Logo */}
           <Link href="/" className="flex items-center gap-3">
-             <div className="w-10 h-10 bg-primary/20 rounded-xl flex items-center justify-center border border-primary/30">
-               <Eye className="text-primary" size={24} />
-             </div>
-             <div className="hidden sm:block">
-               <span className="text-xl font-black tracking-tighter text-white">LUPA</span>
-               <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest leading-none">Vigía Medellín</p>
-             </div>
+            <div className="w-10 h-10 bg-primary/20 rounded-xl flex items-center justify-center border border-primary/30">
+              <Eye className="text-primary" size={24} />
+            </div>
+            <div className="hidden sm:block">
+              <span className="text-xl font-black tracking-tighter text-white">LUPA</span>
+              <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest leading-none">Vigía Medellín</p>
+            </div>
           </Link>
 
           {/* Desktop Nav */}
           <div className="hidden md:flex items-center gap-8">
             {NAV_LINKS.map((link) => (
-              <Link 
-                key={link.href} 
+              <Link
+                key={link.href}
                 href={link.href}
-                className={`text-sm font-medium transition-colors hover:text-primary ${
-                  pathname === link.href ? 'text-primary' : 'text-slate-300'
-                } ${link.highlight ? 'px-4 py-2 bg-primary/10 border border-primary/20 rounded-full' : ''}`}
+                className={`text-sm font-medium transition-colors hover:text-primary ${pathname === link.href ? 'text-primary' : 'text-slate-300'
+                  } ${link.highlight ? 'px-4 py-2 bg-primary/10 border border-primary/20 rounded-full' : ''}`}
               >
                 {link.name}
               </Link>
@@ -49,7 +49,7 @@ export default function Header() {
           </div>
 
           {/* Mobile Button */}
-          <button 
+          <button
             className="md:hidden p-2 text-slate-400 hover:text-white"
             onClick={() => setIsOpen(!isOpen)}
           >

@@ -1,27 +1,55 @@
-# LUPA v1.1 - SECOP Analysis
-# Ignore large data files
+# Data folders (Raw, Processed, Local)
 data/raw/
 data/processed/
+workers/data/
+data/
+**/data/
 
-# Ignore Python cache
+# Environment and Secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+dist/
+build/
+.next/
+out/
+.venv/
+env/
+venv/
+ENV/
+
+# Python cache / metadata
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.coverage
+.mypy_cache/
 
-# Ignore OS files
+# IDE / Editor
+.vscode/
+.idea/
+
+# OS files
 .DS_Store
 Thumbs.db
 
-# Keep reports (if smaller than 50MB)
-!reports/
-!reports/*.csv
-node_modules
-.next
-.gemini/
-.env
-.env.local
-.venv
-venv/
-out/
-build/
-dist/
+# Local logs and temp scripts
+*.log
+tmp_*.py
+check_*.py
+inspect_*.py
+debug_*.py
+test_*.py
+run_lotes.bat
+.qwen/
+"Conversaciones Con Gemini y demas/"
+
+# Personal tasks/notes
+task*.md
+implementation_plan*.md
+walkthrough*.md
+task.md
